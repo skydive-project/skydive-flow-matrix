@@ -50,9 +50,6 @@ def flow_matrix(restclient, listen_ports, matrix):
         for flow_id, entries in sockets[0].items():
             # read both ends of the flow
             for socket in entries:
-                if socket["State"] != "ESTABLISHED":
-                    break
-
                 if socket["RemotePort"] in listen_ports:
                     server_address = socket["RemoteAddress"]
                     server_port = socket["RemotePort"]
@@ -112,11 +109,14 @@ def topology_matrix(restclient, host_nodes, listen_ports, matrix):
                     peer = peers[0]
                     socket_peer = get_socket(peer, socket["RemoteAddress"],
                                              socket["RemotePort"])
+                    if not socket_peer:
+                        continue
                     # workaround, check both integer value plus string until
                     # we fix the protocol format flapping issue
-                    protocol = "UDP"
-                    if socket["Protocol"] == 2 or socket["Protocol"] == "TCP":
-                        protocol = "TCP"
+                    #    protocol = "UDP"
+                    #    if socket["Protocol"] == 2 or socket["Protocol"] == "TCP":
+                    #        protocol = "TCP"
+                    protocol = socket["Protocol"]
 
                     matrix.add(','.join([
                           protocol, node.host,
