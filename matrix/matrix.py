@@ -145,7 +145,6 @@ class Matrix:
                             socket["Name"], peer.host, socket["RemoteAddress"],
                             socket_peer["Process"], socket_peer["Name"]
                         ]))
-                    return self.matrix
 
 
 def main():
