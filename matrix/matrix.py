@@ -137,15 +137,9 @@ class Matrix:
                                                  socket["RemotePort"])
                         if not socket_peer:
                             continue
-                        # workaround, check both integer value plus string until
-                        # we fix the protocol format flapping issue
-                        #    protocol = "UDP"
-                        #    if socket["Protocol"] == 2 or socket["Protocol"] == "TCP":
-                        #        protocol = "TCP"
-                        protocol = socket["Protocol"]
 
                         self.matrix.add(','.join([
-                            protocol, node.host,
+                            socket["Protocol"], node.host,
                             socket["LocalAddress"],
                             str(socket["LocalPort"]), socket["Process"],
                             socket["Name"], peer.host, socket["RemoteAddress"],
