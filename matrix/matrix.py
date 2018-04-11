@@ -5,13 +5,14 @@ import argparse
 from skydive.rest.client import RESTClient
 
 
-def get_socket(node, local_addr, local_port):
+def get_socket(node, protocol, local_addr, local_port):
     if "Sockets" not in node.metadata:
         return
     for socket in node.metadata["Sockets"]:
-        if socket["LocalAddress"] == local_addr and socket["LocalPort"] == local_port:
+        if (socket["Protocol"] == protocol and
+            socket["LocalAddress"] == local_addr and
+            socket["LocalPort"] == local_port):
             return socket
-
 
 def is_listen_socket(socket):
     return (socket["State"] == "LISTEN" or (
@@ -27,24 +28,34 @@ class Matrix:
         self.use_flows = use_flows
         self.at = at
         self.duration = duration
+        self.unknown_cnx = []
+        self.host_cache = {}
 
     def get_matrix(self):
         # get all the sockets informations
         host_nodes = self.restclient.lookup_nodes(
-            "G.V().Has('Type', 'host').HasKey('Sockets')")
+            "G.%sV().Has('Type', 'host').HasKey('Sockets')" % self.get_context())
         if not host_nodes:
             return
 
         # list all the LISTEN sockets and their nodes
         listen_ports = set()
+        peer_sockets = {}
         for node in host_nodes:
             for socket in node.metadata["Sockets"]:
+                lport = socket["LocalPort"]
                 if is_listen_socket(socket):
-                    listen_ports.add(socket["LocalPort"])
+                    listen_ports.add(lport)
+                else:
+                    if lport not in peer_sockets:
+                        peer_sockets[lport] = []
+                    peer_sockets[lport].append(
+                        {"node": node, "socket": socket}
+                    )
 
         self.matrix = set()
 
-        self.topology_matrix(host_nodes, listen_ports)
+        self.topology_matrix(host_nodes, listen_ports, peer_sockets)
         if self.use_flows:
             self.flow_matrix(listen_ports)
 
@@ -57,25 +68,43 @@ class Matrix:
             return "Context('%s')." % self.at
         return "Context('%s', %d)." % (self.at, self.duration)
 
-    def get_node_by_addr(self, address, node_cache):
+    def get_node_by_addr(self, address):
         node = None
 
-        if address in node_cache:
-            return node_cache[address]
+        if address in self.host_cache:
+            return self.host_cache[address]
         nodes = self.restclient.lookup_nodes(
             "G.%sV().Has('IPV4', IPV4Range('%s/32')).In('Type', 'host')" %
             (self.get_context(), address))
         if len(nodes) > 0:
             node = nodes[0]
-            node_cache[address] = node
+            self.host_cache[address] = node
         return node
+      
+    def get_socket_peer(self, sockets, protocol, local_addr, local_port):
+        if local_port not in sockets.keys():
+            return
+        for socket in sockets[local_port]:
+            s = socket["socket"]
+            if s["Protocol"] == protocol and s["LocalAddress"] == local_addr and s["LocalPort"] == local_port:
+                return socket
+
+        if protocol == "UDP":
+            node = self.get_node_by_addr(local_addr)
+            if not node:
+                return
+            for socket in node.metadata["Sockets"]:
+                if (socket["Protocol"] == "UDP" and
+                    is_listen_socket(socket) and
+                    socket["LocalPort"] == local_port):
+                    return {"node": node, "socket": socket}
 
     def flow_matrix(self, listen_ports):
         sockets = self.restclient.lookup(
             "G.%sFlows().Has('Transport', NE('')).Sockets()" %
             self.get_context())
         if sockets:
-            host_cache = {}
+            self.host_cache = {}
 
         for flow_id, entries in sockets[0].items():
             # read both ends of the flow
@@ -85,13 +114,14 @@ class Matrix:
                     server_port = socket["RemotePort"]
 
                     # get server node
-                    node = self.get_node_by_addr(server_address,
-                                                 host_cache)
+                    node = self.get_node_by_addr(server_address)
                     if not node:
                         break
 
                     server_socket = get_socket(node,
-                                               server_address, server_port)
+                                               socket["Protocol"],
+                                               server_address,
+                                               server_port)
                     if not server_socket:
                         break
 
@@ -100,7 +130,7 @@ class Matrix:
                     server_proc_name = server_socket["Name"]
 
                     client_address = socket["LocalAddress"]
-                    node = self.get_node_by_addr(client_address, host_cache)
+                    node = self.get_node_by_addr(client_address)
                     if not node:
                         continue
 
@@ -114,37 +144,32 @@ class Matrix:
                                    server_proc_name, client, client_address,
                                    client_proc, client_proc_name]))
 
-    def topology_matrix(self, host_nodes, listen_ports):
+    def topology_matrix(self, host_nodes, listen_ports, peer_sockets):
         for node in host_nodes:
             for socket in node.metadata["Sockets"]:
                 # get server side connections so having LocalPort listenning
-                if ((socket["State"] == "ESTABLISHED" or self.at) and
-                    socket["LocalPort"] in listen_ports):
+                if (socket["RemotePort"] in listen_ports and
+                    (socket["State"] == "ESTABLISHED" or (self.at and not is_listen_socket(socket)))
+                    ):
 
-                    # find the other side of the connections in order to get the process
-                    query = "G.%sV()." % self.get_context()
-                    if not self.at:
-                        query += "Has('Sockets.State', 'ESTABLISHED')."
-                    query += ("Has('Sockets.LocalAddress', '%s', 'Sockets.LocalPort', %s, " +
-                              "'Sockets.RemoteAddress', '%s', 'Sockets.RemotePort', %s)"
-                    ) % (socket["RemoteAddress"], socket["RemotePort"],
-                         socket["LocalAddress"], socket["LocalPort"])
-                    peers = self.restclient.lookup_nodes(query)
+                    peer = self.get_socket_peer(peer_sockets,
+                                                socket["Protocol"],
+                                                socket["RemoteAddress"],	
+                                                socket["RemotePort"])
+                    if not peer:
+                        cnx = {"node": node, "socket": socket}
+                        if cnx not in self.unknown_cnx:
+                            self.unknown_cnx.append(cnx)
+                        continue
+                    socket_peer = peer["socket"]
 
-                    if len(peers) > 0:
-                        peer = peers[0]
-                        socket_peer = get_socket(peer, socket["RemoteAddress"],
-                                                 socket["RemotePort"])
-                        if not socket_peer:
-                            continue
-
-                        self.matrix.add(','.join([
-                            socket["Protocol"], node.host,
-                            socket["LocalAddress"],
-                            str(socket["LocalPort"]), socket["Process"],
-                            socket["Name"], peer.host, socket["RemoteAddress"],
-                            socket_peer["Process"], socket_peer["Name"]
-                        ]))
+                    self.matrix.add(','.join([
+                        socket["Protocol"], peer["node"].host,
+                        socket["RemoteAddress"],
+                        str(socket["RemotePort"]), socket_peer["Process"],
+                        socket_peer["Name"], node.host, socket["LocalAddress"],
+                        socket["Process"], socket["Name"]
+                    ]))
 
 
 def main():
@@ -177,6 +202,10 @@ def main():
     parser.add_argument('--duration', type=int, default=0,
                         dest='duration',
                         help='gremlin time duration context')
+    parser.add_argument('--list-no-peers', default=False,
+                        dest='list_no_peers',
+                        action="store_true",
+                        help="list connection peer not found/tracked by skydive")
 
     args = parser.parse_args()
 
@@ -194,6 +223,11 @@ def main():
     for e in result:
         print(e)
 
+    if args.list_no_peers:
+        print("peer not found for connection:")
+        for cnx in matrix.unknown_cnx:
+            socket = cnx["socket"]
+            print(socket["Protocol"], cnx["node"].host, socket["RemotePort"], socket)
 
 if __name__ == '__main__':
     main()
