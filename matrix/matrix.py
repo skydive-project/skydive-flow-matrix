@@ -22,9 +22,17 @@
 #
 
 import argparse
+import ipaddress
+import uuid
 
 from graphviz import Digraph
+
+from skydive.graph import Node, Edge
 from skydive.rest.client import RESTClient
+from skydive.websocket.client import WSClient
+from skydive.websocket.client import WSClientDebugProtocol
+from skydive.websocket.client import WSMessage
+from skydive.websocket.client import NodeAddedMsgType, EdgeAddedMsgType
 
 
 def get_socket(node, protocol, local_addr, local_port):
@@ -43,6 +51,11 @@ def is_listen_socket(socket):
              socket["State"] == "CLOSE" and
              (socket["RemoteAddress"] == "0.0.0.0" or
               socket["RemoteAddress"] == "::"))))
+
+
+def is_loop_back(addr):
+    ip = ipaddress.ip_address(addr)
+    return ip.is_loopback
 
 
 class MatrixEntry:
@@ -138,12 +151,16 @@ class Matrix:
             self.host_cache[address] = node
         return node
 
-    def get_socket_peer(self, sockets, protocol, local_addr, local_port):
+    def get_socket_peer(self, sockets, protocol, local_addr, local_port, from_node):
         if local_port not in sockets.keys():
             return
         for socket in sockets[local_port]:
             s = socket["socket"]
-            if (s["Protocol"] == protocol and s["LocalAddress"] == local_addr and
+            if is_loop_back(local_addr):
+                if (s["Protocol"] == protocol and s["LocalAddress"] == local_addr and
+                    s["LocalPort"] == local_port and socket["node"].host == from_node.host):
+                    return socket
+            elif (s["Protocol"] == protocol and s["LocalAddress"] == local_addr and
                     s["LocalPort"] == local_port):
                 return socket
 
@@ -164,7 +181,7 @@ class Matrix:
         if sockets:
             self.host_cache = {}
 
-        for flow_id, entries in sockets[0].items():
+        for _, entries in sockets[0].items():
             # read both ends of the flow
             for socket in entries:
                 if socket["RemotePort"] in listen_ports:
@@ -221,7 +238,8 @@ class Matrix:
                     peer = self.get_socket_peer(peer_sockets,
                                                 socket["Protocol"],
                                                 socket["RemoteAddress"],
-                                                socket["RemotePort"])
+                                                socket["RemotePort"],
+                                                node)
                     if not peer:
                         cnx = {"node": node, "socket": socket}
                         if cnx not in self.unknown_cnx:
@@ -263,14 +281,16 @@ def csv_output(matrix, list_no_peers=False):
                   socket["RemotePort"], socket)
 
 
-def dot_output(matrix):
+def dot_output(matrix, engine, render):
     result = matrix.get_matrix()
     if result is None:
         print("No result, please check analyzer address")
         return
 
-    g = Digraph(comment='Skydive Flow matrix repport')
-    g.body.append('rankdir=LR')
+    g = Digraph(comment='Skydive Flow matrix repport', engine=engine)
+    g.attr(overlap='false')
+    g.attr(ranksep='1')
+    g.attr(nodesep='0.7')
 
     endpoints = {}
     for entry in result:
@@ -287,17 +307,89 @@ def dot_output(matrix):
     for k, v in endpoints.iteritems():
         with g.subgraph(name='cluster_' + k) as c:
             c.body.append('label="' + k + '"')
+            c.body.append('fontsize="24"')
+            c.body.append('color="gray50"')
+            c.body.append('style="filled"')
+            c.body.append('fillcolor="gray90"')
+
             for name in v:
-                c.node(k+name, label=name, shape='box')
+                c.node(k+name, label=name+'\\n\\n'+k, shape='component', color='orangered', fillcolor='orange', style='filled')
 
     for entry in result:
         g.edge(entry.client_host+entry.client_name,
                entry.service_host+entry.service_name,
-               label=(entry.protocol + ":" +
+               label=(entry.protocol + " : " +
                       entry.service_address + ":" +
                       str(entry.service_port)))
 
-    g.view()
+    if render:
+        g.view()
+    else:
+        print(g.source)
+
+class WSMatrixProtocol(WSClientDebugProtocol):
+
+    def onOpen(self):
+        result = self.factory.kwargs["result"]
+
+        endpoints = {}
+        for entry in result:
+            if entry.service_host in endpoints:
+                endpoints[entry.service_host].add(entry.service_name)
+            else:
+                endpoints[entry.service_host] = set([entry.service_name])
+
+            if entry.client_host in endpoints:
+                endpoints[entry.client_host].add(entry.client_name)
+            else:
+                endpoints[entry.client_host] = set([entry.client_name])
+
+        for k, v in endpoints.iteritems():
+            """
+            hid = uuid.uuid5(uuid.NAMESPACE_DNS, str(k))
+            node = Node(str(hid), k, metadata={"Name": k, "Type": "host"})
+            msg = WSMessage("Graph", NodeAddedMsgType, node)
+
+            self.sendWSMessage(msg)
+            """
+            for name in v:
+                nid = uuid.uuid5(uuid.NAMESPACE_DNS, str(k+name))
+                node = Node(str(nid), k, metadata={"Name": name, "Type": "service"})
+                msg = WSMessage("Graph", NodeAddedMsgType, node)
+                self.sendWSMessage(msg)
+
+                """
+                edge = Edge(str(uuid.uuid1()), k, str(hid), str(nid),
+                            metadata={"RelationType": "ownership"})
+                msg = WSMessage("Graph", EdgeAddedMsgType, edge)
+                self.sendWSMessage(msg)
+                """
+
+        for entry in result:
+            try:
+                nid1 = uuid.uuid5(uuid.NAMESPACE_DNS, str(entry.client_host+entry.client_name))
+                nid2 = uuid.uuid5(uuid.NAMESPACE_DNS, str(entry.service_host+entry.service_name))
+                edge = Edge(str(uuid.uuid1()), k, str(nid1), str(nid2),
+                            metadata={"RelationType": "layer2", "Type": "Connection"})
+                msg = WSMessage("Graph", EdgeAddedMsgType, edge)
+                self.sendWSMessage(msg)
+            except Exception as e:
+                print(e)
+
+        #self.stop()
+
+def skydive_output(matrix):
+    result = matrix.get_matrix()
+    if result is None:
+        print("No result, please check analyzer address")
+        return
+
+    client = WSClient('localhost', 'ws://localhost:8082/ws/publisher',
+                      protocol=WSMatrixProtocol,
+                      result=result)
+
+    client.connect()
+    client.start()
 
 
 def main():
@@ -334,10 +426,12 @@ def main():
                         dest='list_no_peers',
                         action="store_true",
                         help="list connection peer not found/tracked by skydive")
-    parser.add_argument('--dot', default=False,
-                        dest='dot',
-                        action="store_true",
-                        help="use dot as output format")
+    parser.add_argument('--format', default="csv",
+                        dest='format', choices=['csv', 'dot', 'render', 'skydive'],
+                        help="specify the output format")
+    parser.add_argument('--engine', default="dot",
+                        dest='engine', choices=['dot', 'circo', 'neato'],
+                        help="specify the rendering engine")
 
     args=parser.parse_args()
 
@@ -349,8 +443,10 @@ def main():
                             username=args.username, password=args.password)
     matrix=Matrix(restclient, args.use_flows, args.at, args.duration)
 
-    if args.dot:
-        dot_output(matrix)
+    if args.format == "dot" or args.format == "render":
+        dot_output(matrix, args.engine, args.format == "render")
+    elif args.format == "skydive":
+        skydive_output(matrix)
     else:
         csv_output(matrix, args.list_no_peers)
 
