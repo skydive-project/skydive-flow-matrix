@@ -1,2 +1,4 @@
 skydive-client>=0.4.2
 graphviz
+ipaddress
+uuid
