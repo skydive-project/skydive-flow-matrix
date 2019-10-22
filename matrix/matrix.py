@@ -24,8 +24,10 @@
 import argparse
 import ipaddress
 import uuid
+import sys
 
 from graphviz import Digraph
+from os import environ
 
 from skydive.graph import Node, Edge
 from skydive.rest.client import RESTClient
@@ -323,6 +325,9 @@ def dot_output(matrix, engine, render):
                       str(entry.service_port)))
 
     if render:
+        if environ.get('DISPLAY') is None:
+            print("skydive-flow-matrix need run on pc with GUI")
+            sys.exit()
         g.view()
     else:
         print(g.source)
