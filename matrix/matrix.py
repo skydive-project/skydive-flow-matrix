@@ -306,7 +306,7 @@ def dot_output(matrix, engine, render):
         else:
             endpoints[entry.client_host] = set([entry.client_name])
 
-    for k, v in endpoints.iteritems():
+    for k, v in endpoints.items():
         with g.subgraph(name='cluster_' + k) as c:
             c.body.append('label="' + k + '"')
             c.body.append('fontsize="24"')
@@ -349,7 +349,7 @@ class WSMatrixProtocol(WSClientDebugProtocol):
             else:
                 endpoints[entry.client_host] = set([entry.client_name])
 
-        for k, v in endpoints.iteritems():
+        for k, v in endpoints.items():
             """
             hid = uuid.uuid5(uuid.NAMESPACE_DNS, str(k))
             node = Node(str(hid), k, metadata={"Name": k, "Type": "host"})
